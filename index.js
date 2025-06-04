@@ -3,10 +3,10 @@ const { MongoClient, ObjectId } = require('mongodb');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 
-const hostname = '127.0.0.1';
+const hostname = '0.0.0.0';
 const port = 3000;
 
-const mongoUrl = 'mongodb://localhost:27017';
+const mongoUrl = 'mongodb://localhost:27017/?retryWrites=true&w=majority&appName=sato_pc';
 const dbName = 'sato_pc'; // You can change this to your preferred database name
 let db;
 
@@ -19,7 +19,8 @@ app.use(express.json());
 app.use(cors({
   origin: [
     'http://localhost:4200',
-    'http://localhost:8080'
+    'http://localhost:8080',
+    'http://192.85.4.69:4200'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
@@ -76,17 +77,25 @@ app.get('/checklists', authenticateToken, async (req, res) => {
       .find({ user: req.user.username })
       .sort({ date_create: -1 })
       .toArray();
-    // Get checklist_detail counts grouped by checklist_id
+    // Get checklist_detail counts and details grouped by checklist_id
     const detailsAgg = await db.collection('checklist_detail').aggregate([
       { $group: { _id: '$checklist_id', total: { $sum: 1 }, details: { $push: '$$ROOT' } } }
     ]).toArray();
     const detailMap = Object.fromEntries(detailsAgg.map(d => [d._id, { total: d.total, details: d.details }]));
-
-    const result = checklists.map(cl => ({
-      ...cl,
-      total: detailMap[cl.checklist_id]?.total || 0,
-      details: detailMap[cl.checklist_id]?.details || []
-    }));
+    // Get all products (jancode -> name)
+    const products = await db.collection('products').find({}, { projection: { jancode: 1, name: 1 } }).toArray();
+    const productNameMap = Object.fromEntries(products.map(p => [p.jancode, p.name]));
+    const result = checklists.map(cl => {
+      const details = (detailMap[cl.checklist_id]?.details || []).map(detail => ({
+        ...detail,
+        name: productNameMap[detail.jancode] || null
+      }));
+      return {
+        ...cl,
+        total: detailMap[cl.checklist_id]?.total || 0,
+        details
+      };
+    });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch checklists' });
@@ -179,6 +188,127 @@ app.post('/delete-settings-ocr', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete settings_ocr' });
+  }
+});
+
+app.get('/search-checklists', async (req, res) => {
+  try {
+    // Get all products count
+    const count = await db.collection('products').countDocuments();
+    const num = Math.floor(Math.random() * 11) + 20; // 20-30
+    // Get random skip values
+    const skips = new Set();
+    while (skips.size < num) {
+      skips.add(Math.floor(Math.random() * count));
+    }
+    const products = [];
+    for (const skip of skips) {
+      const product = await db.collection('products').find().skip(skip).limit(1).toArray();
+      if (product[0]) {
+        products.push({
+          ...product[0],
+          dateline: 'null',
+          datetime: 'null'
+        });
+      }
+    }
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to search checklists' });
+  }
+});
+
+app.post('/create-checklist', authenticateToken, async (req, res) => {
+  const { jancodes } = req.body;
+  if (!Array.isArray(jancodes) || jancodes.length === 0) {
+    return res.status(400).json({ error: 'jancodes must be a non-empty array' });
+  }
+  try {
+    // Get the next checklist_id
+    const lastChecklist = await db.collection('checklists').find().sort({ checklist_id: -1 }).limit(1).toArray();
+    const nextChecklistId = lastChecklist.length > 0 ? lastChecklist[0].checklist_id + 1 : 1;
+    const now = new Date();
+    const dateStr = now.toISOString().slice(0, 10);
+    const checklist = {
+      checklist_id: nextChecklistId,
+      checklist_name: `チェックリスト ${dateStr}`,
+      date_create: dateStr,
+      status: 0,
+      user: req.user.username
+    };
+    await db.collection('checklists').insertOne(checklist);
+    const details = jancodes.map(jancode => ({
+      checklist_id: nextChecklistId,
+      jancode,
+      dateline: null,
+      datetime: null
+    }));
+    await db.collection('checklist_detail').insertMany(details);
+    // Join with products to get name for each jancode
+    const products = await db.collection('products').find({ jancode: { $in: jancodes } }, { projection: { jancode: 1, name: 1 } }).toArray();
+    const productNameMap = Object.fromEntries(products.map(p => [p.jancode, p.name]));
+    const detailsWithName = details.map(d => ({
+      ...d,
+      name: productNameMap[d.jancode] || null
+    }));
+    const data = { ...checklist, details: detailsWithName };
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create checklist' });
+  }
+});
+
+app.get('/product/:jancode', async (req, res) => {
+  const { jancode } = req.params;
+  try {
+    const product = await db.collection('products').findOne({ jancode });
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    res.json(product);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch product' });
+  }
+});
+
+app.post('/create-product', authenticateToken, async (req, res) => {
+  const { jancode, dateline } = req.body;
+  if (!jancode || !dateline) {
+    return res.status(400).json({ error: 'jancode and dateline are required' });
+  }
+  try {
+    // Check if product exists
+    const product = await db.collection('products').findOne({ jancode });
+    const newProduct = {
+      jancode,
+      name: '商品マスタなし',
+      dateline,
+      date_discount: 60,
+      date_recall: 40
+    };
+    if (!product) {
+      // Insert new product
+      await db.collection('products').insertOne(newProduct);
+      // Insert into custome_products with user
+    } 
+    const customProduct = {
+      ...newProduct,
+      user: req.user.username
+    };
+    await db.collection('custom_products').insertOne(customProduct);
+    return res.json({ success: true, product: newProduct, customProduct });
+    
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create product' });
+  }
+});
+
+app.get('/custom-products', authenticateToken, async (req, res) => {
+  try {
+    const products = await db.collection('custom_products').find({ user: req.user.username }).toArray();
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch custom products' });
   }
 });
 
